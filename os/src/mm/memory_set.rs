@@ -262,6 +262,30 @@ impl MemorySet {
             false
         }
     }
+
+    /// unmap the area starting at `start_vpn` and remove it from the set
+    ///
+    /// The area must cover exactly `pages` pages, so that a request reaching
+    /// beyond an existing mapping is rejected instead of being partly applied.
+    /// Returns true if the area was removed.
+    pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum, pages: usize) -> bool {
+        if let Some(idx) = self
+            .areas
+            .iter()
+            .position(|area| area.vpn_range.get_start() == start_vpn)
+        {
+            if self.areas[idx].vpn_range.get_end().0 - start_vpn.0 != pages {
+                return false;
+            }
+            // Clearing the page table entries drops the data frames, which
+            // returns the physical pages to the frame allocator.
+            self.areas[idx].unmap(&mut self.page_table);
+            self.areas.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

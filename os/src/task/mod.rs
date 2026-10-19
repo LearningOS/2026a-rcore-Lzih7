@@ -133,6 +133,34 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Record one call of the syscall with `syscall_id` for the current task
+    fn add_current_syscall_count(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].add_syscall_count(syscall_id);
+    }
+
+    /// Get how many times the current task has called the syscall with `syscall_id`
+    fn get_current_syscall_count(&self, syscall_id: usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_count(syscall_id)
+    }
+
+    /// Map user memory for the current task
+    fn mmap_current_task(&self, start: usize, len: usize, port: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].mmap(start, len, port)
+    }
+
+    /// Unmap user memory for the current task
+    fn munmap_current_task(&self, start: usize, len: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].munmap(start, len)
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +229,29 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Record one call of the syscall with `syscall_id` for the current task.
+///
+/// It must be called before the syscall is dispatched, so that a `sys_trace`
+/// query observes the count including the query call itself.
+pub fn add_syscall_count(syscall_id: usize) {
+    TASK_MANAGER.add_current_syscall_count(syscall_id);
+}
+
+/// Get how many times the current task has called the syscall with `syscall_id`
+pub fn syscall_count(syscall_id: usize) -> usize {
+    TASK_MANAGER.get_current_syscall_count(syscall_id)
+}
+
+/// Map `len` bytes of user memory starting at the page-aligned `start`
+/// with permission `port` for the current task
+pub fn mmap_current_task(start: usize, len: usize, port: usize) -> isize {
+    TASK_MANAGER.mmap_current_task(start, len, port)
+}
+
+/// Unmap `len` bytes of user memory starting at the page-aligned `start`
+/// for the current task
+pub fn munmap_current_task(start: usize, len: usize) -> isize {
+    TASK_MANAGER.munmap_current_task(start, len)
 }

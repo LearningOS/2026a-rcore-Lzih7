@@ -1,6 +1,6 @@
 //! Types related to task management
 use super::TaskContext;
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::mm::{
     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
 };
@@ -28,6 +28,9 @@ pub struct TaskControlBlock {
 
     /// Program break
     pub program_brk: usize,
+
+    /// How many times this task has called each syscall, indexed by syscall id
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
 }
 
 impl TaskControlBlock {
@@ -39,6 +42,89 @@ impl TaskControlBlock {
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
     }
+    /// Record one call of the syscall with `syscall_id` for this task
+    pub fn add_syscall_count(&mut self, syscall_id: usize) {
+        if syscall_id < MAX_SYSCALL_NUM {
+            self.syscall_times[syscall_id] += 1;
+        }
+    }
+    /// Get how many times this task has called the syscall with `syscall_id`
+    pub fn syscall_count(&self, syscall_id: usize) -> usize {
+        if syscall_id < MAX_SYSCALL_NUM {
+            self.syscall_times[syscall_id] as usize
+        } else {
+            0
+        }
+    }
+    /// Map `len` bytes of user memory starting at the page-aligned `start`.
+    ///
+    /// `port` bit 0 is readable, bit 1 is writable and bit 2 is executable; any
+    /// other bit, or a zero `port`, is invalid. Returns 0 on success.
+    pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> isize {
+        let page_size = crate::config::PAGE_SIZE;
+        if start % page_size != 0 || len == 0 || port == 0 || port & !0b111 != 0 {
+            return -1;
+        }
+        // Round the end up to a page boundary, since `len` need not be aligned.
+        let end = match start.checked_add(len).and_then(|end| end.checked_add(page_size - 1)) {
+            Some(end) => end / page_size * page_size,
+            None => return -1,
+        };
+        // `PageTable::map` asserts that a page is not mapped twice, so the whole
+        // range has to be checked before inserting the new area.
+        let mut address = start;
+        while address < end {
+            if self
+                .memory_set
+                .translate(VirtAddr::from(address).floor())
+                .map_or(false, |pte| pte.is_valid())
+            {
+                return -1;
+            }
+            address += page_size;
+        }
+        // The user address must always be accessible in U mode.
+        let mut permission = MapPermission::U;
+        if port & 0b1 != 0 {
+            permission |= MapPermission::R;
+        }
+        if port & 0b10 != 0 {
+            permission |= MapPermission::W;
+        }
+        if port & 0b100 != 0 {
+            permission |= MapPermission::X;
+        }
+        self.memory_set.insert_framed_area(
+            VirtAddr::from(start),
+            VirtAddr::from(end),
+            permission,
+        );
+        0
+    }
+
+    /// Unmap `len` bytes of user memory starting at the page-aligned `start`.
+    ///
+    /// The range must match an existing mapping of this task exactly, so a
+    /// request reaching beyond it fails. Returns 0 on success.
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        let page_size = crate::config::PAGE_SIZE;
+        if start % page_size != 0 || len == 0 {
+            return -1;
+        }
+        let pages = match len.checked_add(page_size - 1) {
+            Some(len) => len / page_size,
+            None => return -1,
+        };
+        if self
+            .memory_set
+            .remove_area_with_start_vpn(VirtAddr::from(start).floor(), pages)
+        {
+            0
+        } else {
+            -1
+        }
+    }
+
     /// Based on the elf info in program, build the contents of task in a new address space
     pub fn new(elf_data: &[u8], app_id: usize) -> Self {
         // memory_set with elf program headers/trampoline/trap context/user stack
@@ -63,6 +149,7 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
+            syscall_times: [0; MAX_SYSCALL_NUM],
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();
