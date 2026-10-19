@@ -5,7 +5,7 @@ FROM ubuntu:22.04
 # Build arguments
 ARG RELEASE
 ARG LAUNCHPAD_BUILD_ARCH
-ARG QEMU_VERSION=7.0.0
+ARG QEMU_VERSION=8.2.10
 ARG HOME=/root
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -14,7 +14,7 @@ RUN apt-get update && \
     apt-get install -y \
     curl \
     git \
-    python3 \
+    python3 python3-venv python3-pip \
     wget \
     xz-utils
 
@@ -33,8 +33,8 @@ RUN apt-get install -y \
     ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev
 
 # Build and install QEMU
-WORKDIR /root/qemu-7.0.0
-RUN ./configure --target-list=riscv64-softmmu,riscv64-linux-user && \
+WORKDIR /root/qemu-${QEMU_VERSION}
+RUN ./configure --target-list=riscv64-softmmu,riscv64-linux-user --disable-docs && \
     make -j$(nproc) && \
     make install
 

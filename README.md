@@ -56,6 +56,8 @@ git switch ch3
 
 `ch3` 至 `ch8` 已同步 SBI System Reset 关机接口适配。不要用旧版本固件替换课程提供的文件；使用旧 Docker 镜像时，需按下面的步骤重新构建镜像，才能使用固定后的构建环境。
 
+本章 Dockerfile 使用 QEMU `8.2.10`，内核使用 SBI TIME 和 DBCN 扩展。旧镜像中的 QEMU `7.0.0` 会在当前 RustSBI 固件读取 `mcountinhibit` 时触发非法指令，表现为停在固件日志后超时。更新 Dockerfile 后执行 `make build_docker`；已有容器仍使用旧镜像，可保留它并通过 `make docker CONTAINER_NAME=rcore-container-ch3` 创建新容器。
+
 ### 运行章节代码
 
 在已切换到 `ch3` 的作业仓库根目录，首次下载用户程序：
