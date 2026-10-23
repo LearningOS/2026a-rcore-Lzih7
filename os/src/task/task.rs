@@ -11,6 +11,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+/// Initial priority of a newly created process, used by the stride scheduler
+pub const INIT_PRIORITY: usize = 16;
+
+/// Large constant from which the stride step is derived: `pass = BIG_STRIDE / priority`
+pub const BIG_STRIDE: usize = 1 << 16;
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -71,6 +77,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Priority used by the stride scheduler, must be greater than 1
+    pub priority: usize,
+
+    /// Current stride of the process; the process with the smallest stride runs next
+    pub stride: usize,
 }
 
 impl TaskControlBlockInner {
@@ -135,6 +147,8 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: INIT_PRIORITY,
+                    stride: 0,
                 })
             },
         };
@@ -216,6 +230,8 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: INIT_PRIORITY,
+                    stride: 0,
                 })
             },
         });

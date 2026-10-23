@@ -4,7 +4,7 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -56,8 +56,12 @@ impl OSInode {
 }
 
 lazy_static! {
+    /// 根目录的全局内存句柄，首次访问时初始化，供文件查找、创建和建硬链接使用。
+    /// 它定位磁盘上编号为 0 的 DiskInode；目录项存放在该 DiskInode 索引的数据块中。
     pub static ref ROOT_INODE: Arc<Inode> = {
+        // 从块设备打开已有的 easy-fs，读取超级块以确定各区域的位置，不重新格式化。
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
+        // 取得根目录 inode 的位置并构造句柄；Arc 支持共享，不复制磁盘 inode 或目录内容。
         Arc::new(EasyFileSystem::root_inode(&efs))
     };
 }
@@ -125,7 +129,33 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+/// Create a hard link in the root directory
+///
+/// The new name refers to the same inode as the old one, so the two names share
+/// the file's data and its link count. Returns false if the old name does not
+/// exist or the new name is already taken.
+pub fn link_file(old_name: &str, new_name: &str) -> bool {
+    ROOT_INODE.link(old_name, new_name).is_some()
+}
+
+/// 删除根目录中的指定目录项，成功返回 true，名称不存在时返回 false。
+pub fn unlink_file(name: &str) -> bool {
+    ROOT_INODE.unlink(name)
+}
+
 impl File for OSInode {
+    fn stat(&self) -> Option<Stat> {
+        let inode = self.inner.exclusive_access().inode.clone();
+        let (ino, is_dir, nlink) = inode.stat();
+        Some(Stat {
+            // 当前只有一个文件系统，使用固定设备编号。
+            dev: 0,
+            ino,
+            mode: if is_dir { StatMode::DIR } else { StatMode::FILE },
+            nlink,
+            pad: [0; 7],
+        })
+    }
     fn readable(&self) -> bool {
         self.readable
     }

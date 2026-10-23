@@ -4,11 +4,15 @@ use alloc::sync::Arc;
 
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    mm::{
+        translated_byte_buffer, translated_refmut, translated_str, MapPermission, PageTable,
+        PTEFlags, VirtAddr,
+    },
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
     },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -102,33 +106,130 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
+/// Write seconds and microseconds to a writable user buffer, including across pages.
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let start = _ts as usize;
+    let len = core::mem::size_of::<TimeVal>();
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return -1,
+    };
+    // 用户缓冲区位于 Sv39 地址空间的低半区
+    if start == 0 || end > (1usize << 38) {
+        return -1;
+    }
+    // 取得当前进程的用户页表 token，用它重建页表对象，从而在 S 态查询用户页表
+    let token = current_user_token();
+    let page_table = PageTable::from_token(token);
+    // 逐页检查：页表项必须有效、可写，并且对用户态可见
+    let mut address = start;
+    while address < end {
+        let va = VirtAddr::from(address);
+        match page_table.translate(va.floor()) {
+            Some(pte) if pte.flags().contains(PTEFlags::V | PTEFlags::U | PTEFlags::W) => {}
+            _ => return -1,
+        }
+        address += (crate::config::PAGE_SIZE - va.page_offset()).min(end - address);
+    }
+    // 先编码到本地字节数组，再按物理页分段写入，避免结构体跨页时写到错误的页
+    let us = get_time_us();
+    let mut bytes = [0u8; core::mem::size_of::<TimeVal>()];
+    let word_size = core::mem::size_of::<usize>();
+    bytes[..word_size].copy_from_slice(&(us / 1_000_000).to_ne_bytes());
+    bytes[word_size..].copy_from_slice(&(us % 1_000_000).to_ne_bytes());
+    let mut offset = 0;
+    for buffer in translated_byte_buffer(token, _ts as *const u8, len) {
+        let next = offset + buffer.len();
+        buffer.copy_from_slice(&bytes[offset..next]);
+        offset = next;
+    }
+    0
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// port 的第 0 位表示可读，第 1 位表示可写，第 2 位表示可执行，其余位必须为 0
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    let page_size = crate::config::PAGE_SIZE;
+    if start % page_size != 0 || len == 0 || port == 0 || port & !0b111 != 0 {
+        return -1;
+    }
+    // 长度向上取整到页边界；start 已对齐，因此取整后的 end 也落在页边界上
+    let end = match start
+        .checked_add(len)
+        .and_then(|end| end.checked_add(page_size - 1))
+    {
+        Some(end) => end / page_size * page_size,
+        None => return -1,
+    };
+    // 逐页确认区间空闲。translate 对未建立的中间页表返回 None，对无效的末级项
+    // 返回 Some，两种情况都说明这一页尚未映射。
+    let page_table = PageTable::from_token(current_user_token());
+    let mut address = start;
+    while address < end {
+        let va = VirtAddr::from(address);
+        if page_table
+            .translate(va.floor())
+            .map_or(false, |pte| pte.is_valid())
+        {
+            return -1;
+        }
+        address += page_size;
+    }
+    // 用户态要访问的映射必须带 U
+    let mut permission = MapPermission::U;
+    if port & 0b1 != 0 {
+        permission |= MapPermission::R;
+    }
+    if port & 0b10 != 0 {
+        permission |= MapPermission::W;
+    }
+    if port & 0b100 != 0 {
+        permission |= MapPermission::X;
+    }
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .memory_set
+        .insert_framed_area(VirtAddr::from(start), VirtAddr::from(end), permission);
+    0
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    let page_size = crate::config::PAGE_SIZE;
+    if start % page_size != 0 || len == 0 {
+        return -1;
+    }
+    // 请求长度按页向上取整，取整后的 end 落在页边界上
+    let end = match start
+        .checked_add(len)
+        .and_then(|end| end.checked_add(page_size - 1))
+    {
+        Some(end) => end / page_size * page_size,
+        None => return -1,
+    };
+    // 区间内每一页都必须在当前用户页表中有效。只要有一页没有映射，就说明请求
+    // 范围超出了已有的区间，此时不能执行取消映射。
+    let page_table = PageTable::from_token(current_user_token());
+    let mut address = start;
+    while address < end {
+        let mapped = page_table
+            .translate(VirtAddr::from(address).floor())
+            .map_or(false, |pte| pte.is_valid());
+        if !mapped {
+            return -1;
+        }
+        address += page_size;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner
+        .memory_set
+        .remove_area_with_start_vpn(VirtAddr::from(start).floor());
+    0
 }
 
 /// change data segment size
@@ -143,19 +244,39 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = app_inode.read_all();
+        let task = current_task().unwrap();
+        let child = task.fork();
+        let child_pid = child.pid.0;
+        // 让子进程执行目标程序，exec 会为它重建整个 TrapContext
+        child.exec(all_data.as_slice());
+        add_task(child);
+        child_pid as isize
+    } else {
+        -1
+    }
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
+/// YOUR JOB: Set task priority.
+///
+/// The priority drives the stride scheduler: a process with priority `p` gets a
+/// stride step of `BIG_STRIDE / p`, so a larger priority means more CPU time.
+/// A priority of 1 or below has no valid stride step and is rejected.
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_set_priority",
         current_task().unwrap().pid.0
     );
-    -1
+    if prio <= 1 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.priority = prio as usize;
+    prio
 }

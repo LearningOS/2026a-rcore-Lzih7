@@ -1,4 +1,5 @@
 //!Implementation of [`TaskManager`]
+use super::task::BIG_STRIDE;
 use super::TaskControlBlock;
 use crate::sync::UPSafeCell;
 use alloc::collections::VecDeque;
@@ -9,7 +10,7 @@ pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// A stride scheduler: the process with the smallest stride runs next.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
@@ -21,9 +22,25 @@ impl TaskManager {
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
+    /// Take the process with the smallest stride out of the ready queue
+    ///
+    /// 被选中的进程随后把自身的 stride 累加一个步长 `pass`，因此优先级越高
+    /// （步长越小）的进程被调度的次数越多。
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let idx = self
+            .ready_queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, task)| task.inner_exclusive_access().stride)
+            .map(|(idx, _)| idx)?;
+        // idx 由上面的遍历得到，必然在范围内
+        let task = self.ready_queue.remove(idx).unwrap();
+        {
+            // 借用在这里结束，之后才能把 task 移出去
+            let mut inner = task.inner_exclusive_access();
+            inner.stride += BIG_STRIDE / inner.priority;
+        }
+        Some(task)
     }
 }
 

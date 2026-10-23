@@ -41,6 +41,40 @@ impl Inode {
             .lock()
             .modify(self.block_offset, f)
     }
+    /// 返回 inode 编号、是否为目录，以及根目录中指向该 inode 的硬链接数。
+    pub fn stat(&self) -> (u64, bool, u32) {
+        let fs = self.fs.lock();
+        let (root_block_id, root_offset) = fs.get_disk_inode_pos(0);
+        let inode_size = core::mem::size_of::<DiskInode>();
+        // 将 inode 所在块号和块内偏移反算为 inode 编号。
+        let inode_id = (self.block_id - root_block_id as usize)
+            * (super::BLOCK_SZ / inode_size)
+            + self.block_offset / inode_size;
+        let is_dir = self.read_disk_inode(|disk_inode| disk_inode.is_dir());
+        let root = Self::new(
+            root_block_id,
+            root_offset,
+            self.fs.clone(),
+            self.block_device.clone(),
+        );
+        // 当前文件系统只有根目录名称入口；链接删除后仍打开的文件可以返回 0。
+        let nlink = root.read_disk_inode(|dir_inode| {
+            let file_count = dir_inode.size as usize / DIRENT_SZ;
+            let mut nlink = 0;
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                assert_eq!(
+                    dir_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
+                    DIRENT_SZ,
+                );
+                if dirent.inode_id() as usize == inode_id {
+                    nlink += 1;
+                }
+            }
+            nlink
+        });
+        (inode_id as u64, is_dir, nlink)
+    }
     /// Find inode under a disk inode by name
     fn find_inode_id(&self, name: &str, disk_inode: &DiskInode) -> Option<u32> {
         // assert it is a directory
@@ -137,6 +171,89 @@ impl Inode {
             self.block_device.clone(),
         )))
         // release efs lock automatically by compiler
+    }
+    /// Create a hard link under current inode (a directory)
+    ///
+    /// The new directory entry `new_name` refers to the same disk inode as the
+    /// existing entry `old_name`, so both names share the file's data. It
+    /// returns `None` when `old_name` does not exist or `new_name` is taken.
+    pub fn link(&self, old_name: &str, new_name: &str) -> Option<Arc<Inode>> {
+        let mut fs = self.fs.lock();
+        // find the disk inode the old name points to, and refuse to overwrite
+        // an existing name
+        let old_inode_id = self.read_disk_inode(|dir_inode| {
+            assert!(dir_inode.is_dir());
+            if self.find_inode_id(new_name, dir_inode).is_some() {
+                return None;
+            }
+            self.find_inode_id(old_name, dir_inode)
+        })?;
+        // append a directory entry that reuses the same inode id
+        self.modify_disk_inode(|dir_inode| {
+            let file_count = (dir_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            // increase size
+            self.increase_size(new_size as u32, dir_inode, &mut fs);
+            // write dirent
+            let dirent = DirEntry::new(new_name, old_inode_id);
+            dir_inode.write_at(file_count * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+        });
+        let (block_id, block_offset) = fs.get_disk_inode_pos(old_inode_id);
+        block_cache_sync_all();
+        // return the inode both names now refer to
+        Some(Arc::new(Self::new(
+            block_id,
+            block_offset,
+            self.fs.clone(),
+            self.block_device.clone(),
+        )))
+    }
+
+    /// 删除指定名称的目录项，成功返回 true，名称不存在时返回 false。
+    /// 保留目标文件的 inode 和数据块，避免影响其他硬链接或已打开的文件。
+    pub fn unlink(&self, name: &str) -> bool {
+        let mut fs = self.fs.lock();
+        let entries = self.read_disk_inode(|dir_inode| {
+            assert!(dir_inode.is_dir());
+            let file_count = dir_inode.size as usize / DIRENT_SZ;
+            let mut entries = Vec::new();
+            let mut found = false;
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                assert_eq!(
+                    dir_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
+                    DIRENT_SZ,
+                );
+                // 按名称删除，而不是按 inode 编号删除所有硬链接。
+                if dirent.name() == name {
+                    found = true;
+                } else {
+                    entries.push(dirent);
+                }
+            }
+            if found { Some(entries) } else { None }
+        });
+        let entries = match entries {
+            Some(entries) => entries,
+            None => return false,
+        };
+        self.modify_disk_inode(|dir_inode| {
+            // 当前没有部分缩容接口，先回收目录自身的块，再重建剩余目录项。
+            // 不能只减 size，否则跨块缩容后会遗留块索引和已分配的数据块。
+            for block_id in dir_inode.clear_size(&self.block_device) {
+                fs.dealloc_data(block_id);
+            }
+            let new_size = entries.len() * DIRENT_SZ;
+            self.increase_size(new_size as u32, dir_inode, &mut fs);
+            for (i, dirent) in entries.iter().enumerate() {
+                assert_eq!(
+                    dir_inode.write_at(i * DIRENT_SZ, dirent.as_bytes(), &self.block_device),
+                    DIRENT_SZ,
+                );
+            }
+        });
+        block_cache_sync_all();
+        true
     }
     /// List inodes under current inode
     pub fn ls(&self) -> Vec<String> {
