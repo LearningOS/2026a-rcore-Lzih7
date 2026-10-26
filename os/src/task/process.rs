@@ -15,6 +15,109 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+/// 进程内所有同步资源的分配状态；Need 记录尚未完成的获取请求。
+pub struct DeadlockDetector {
+    /// 是否拒绝不安全的资源请求。
+    pub enabled: bool,
+    available: Vec<usize>,
+    allocation: Vec<Vec<usize>>,
+    need: Vec<Vec<usize>>,
+    live: Vec<bool>,
+}
+
+impl DeadlockDetector {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            available: Vec::new(),
+            allocation: Vec::new(),
+            need: Vec::new(),
+            live: Vec::new(),
+        }
+    }
+
+    /// 登记一种新资源，返回检测器内部的资源编号。
+    pub fn add_resource(&mut self, count: usize) -> usize {
+        let id = self.available.len();
+        self.available.push(count);
+        for row in self.allocation.iter_mut() {
+            row.push(0);
+        }
+        for row in self.need.iter_mut() {
+            row.push(0);
+        }
+        id
+    }
+
+    fn add_thread(&mut self, tid: usize) {
+        while self.live.len() <= tid {
+            self.live.push(false);
+            self.allocation.push(vec![0; self.available.len()]);
+            self.need.push(vec![0; self.available.len()]);
+        }
+        self.live[tid] = true;
+        self.allocation[tid].fill(0);
+        self.need[tid].fill(0);
+    }
+
+    /// 线程退出不等于解锁；遗留资源不能在安全性模拟中被自动回收。
+    pub fn exit_thread(&mut self, tid: usize) {
+        self.live[tid] = false;
+        self.need[tid].fill(0);
+    }
+
+    /// 先登记请求；不安全时撤销请求，保持实际资源状态不变。
+    pub fn request(&mut self, tid: usize, resource: usize) -> bool {
+        self.need[tid][resource] += 1;
+        if self.enabled && !self.is_safe() {
+            self.need[tid][resource] -= 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn is_safe(&self) -> bool {
+        let mut work = self.available.clone();
+        let mut finish: Vec<bool> = self.live.iter().map(|live| !live).collect();
+        loop {
+            let mut progress = false;
+            for tid in 0..finish.len() {
+                if !finish[tid]
+                    && self.need[tid]
+                        .iter()
+                        .zip(&work)
+                        .all(|(need, free)| need <= free)
+                {
+                    for (free, held) in work.iter_mut().zip(&self.allocation[tid]) {
+                        *free += held;
+                    }
+                    finish[tid] = true;
+                    progress = true;
+                }
+            }
+            if !progress {
+                return finish.iter().all(|done| *done);
+            }
+        }
+    }
+
+    /// 实际分配资源，并清除该次请求。
+    pub fn acquire(&mut self, tid: usize, resource: usize) {
+        self.available[resource] -= 1;
+        self.need[tid][resource] -= 1;
+        self.allocation[tid][resource] += 1;
+    }
+
+    /// semaphore 的 up 允许由未持有资源的线程发起。
+    pub fn release(&mut self, tid: usize, resource: usize) {
+        if self.allocation[tid][resource] != 0 {
+            self.allocation[tid][resource] -= 1;
+        }
+        self.available[resource] += 1;
+    }
+}
+
 /// Process Control Block
 pub struct ProcessControlBlock {
     /// immutable
@@ -49,6 +152,8 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// mutex 与 semaphore 共享的死锁检测状态。
+    pub deadlock: DeadlockDetector,
 }
 
 impl ProcessControlBlockInner {
@@ -68,7 +173,9 @@ impl ProcessControlBlockInner {
     }
     /// allocate a new task id
     pub fn alloc_tid(&mut self) -> usize {
-        self.task_res_allocator.alloc()
+        let tid = self.task_res_allocator.alloc();
+        self.deadlock.add_thread(tid);
+        tid
     }
     /// deallocate a task id
     pub fn dealloc_tid(&mut self, tid: usize) {
@@ -119,6 +226,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock: DeadlockDetector::new(),
                 })
             },
         });
@@ -245,6 +353,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock: DeadlockDetector::new(),
                 })
             },
         });

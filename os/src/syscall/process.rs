@@ -1,10 +1,14 @@
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{
+        translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
+        VirtAddr,
+    },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
     },
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
 
@@ -146,17 +150,49 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     }
 }
 
-/// get_time syscall
-///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+/// 获取秒和微秒，检查用户写权限并支持结构体跨页写回。
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let start = ts as usize;
+    let len = core::mem::size_of::<TimeVal>();
+    let end = match start.checked_add(len) {
+        Some(end) if start != 0 && end <= (1usize << 38) => end,
+        _ => return -1,
+    };
+    let token = current_user_token();
+    let page_table = PageTable::from_token(token);
+    // U 位位于页表项第 4 位；逐页检查，避免只验证结构体的起始地址。
+    const USER_PTE_BIT: usize = 1 << 4;
+    let mut address = start;
+    while address < end {
+        let va = VirtAddr::from(address);
+        match page_table.translate(va.floor()) {
+            Some(pte)
+                if pte.is_valid()
+                    && pte.readable()
+                    && pte.writable()
+                    && pte.bits & USER_PTE_BIT != 0 => {}
+            _ => return -1,
+        }
+        address += (crate::config::PAGE_SIZE - va.page_offset()).min(end - address);
+    }
+
+    // 编码成字节后按页写回，不要求用户缓冲区对齐或物理页连续。
+    let us = get_time_us();
+    let mut bytes = [0u8; core::mem::size_of::<TimeVal>()];
+    let word_size = core::mem::size_of::<usize>();
+    bytes[..word_size].copy_from_slice(&(us / 1_000_000).to_ne_bytes());
+    bytes[word_size..].copy_from_slice(&(us % 1_000_000).to_ne_bytes());
+    let mut offset = 0;
+    for buffer in translated_byte_buffer(token, ts as *const u8, len) {
+        let next = offset + buffer.len();
+        buffer.copy_from_slice(&bytes[offset..next]);
+        offset = next;
+    }
+    0
 }
 
 /// mmap syscall
